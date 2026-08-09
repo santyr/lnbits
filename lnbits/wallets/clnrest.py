@@ -42,6 +42,7 @@ class CLNRestWallet(Wallet):
     - description-hash invoices
     - preimage verification
     - correct waitanyinvoice semantics
+    - listener bootstrap to prevent historical payment replay
     - payment reconciliation/idempotency
     - ambiguous "already paid" responses
     - improved CLN REST error reporting
@@ -128,7 +129,7 @@ class CLNRestWallet(Wallet):
         if self.renepay_headers:
             logger.warning(
                 "CLNREST_RENEPAY_RUNE is configured. Core Lightning renepay "
-                "is deprecated as of v26.06; pay will be preferred when available."
+                "is deprecated; pay will be preferred when available."
             )
 
         # Core Lightning pay errors that are known to be terminal.
@@ -149,10 +150,11 @@ class CLNRestWallet(Wallet):
 
         self.client = self._create_client()
 
-        # Preserve the upstream setting semantics.  Do not automatically jump
-        # this forward to the newest historical payment, since doing so could
-        # skip invoices that were paid while LNbits was offline.
+        # A non-zero operator-provided value is treated as an explicit cursor.
+        # If unset/zero, paid_invoices_stream() bootstraps to the highest
+        # currently paid pay_index so historical invoices are not replayed.
         self.last_pay_index = int(settings.clnrest_last_pay_index or 0)
+        self._listener_bootstrapped = False
 
     async def cleanup(self):
         try:
@@ -250,7 +252,7 @@ class CLNRestWallet(Wallet):
         if unhashed_description:
             try:
                 description = unhashed_description.decode("utf-8")
-            except UnicodeDecodeError as exc:
+            except UnicodeDecodeError:
                 return InvoiceResponse(
                     ok=False,
                     error_message="unhashed_description must contain valid UTF-8",
@@ -273,8 +275,6 @@ class CLNRestWallet(Wallet):
                         ),
                     )
 
-            # Core Lightning takes the original description and hashes it
-            # internally when deschashonly is true.
             data["description"] = description
             data["deschashonly"] = True
         else:
@@ -408,19 +408,14 @@ class CLNRestWallet(Wallet):
 
             # A previous failed attempt does not prevent CLN from retrying.
         except Exception as exc:
-            # Failure to query listpays must not prevent a new payment attempt.
             logger.debug(
                 f"Could not preflight listpays for {payment_hash}: {exc}"
             )
 
         label = _generate_label()
 
-        #
-        # Prefer `pay`.
-        #
-        # renepay is deprecated by current Core Lightning. Keep it available
-        # for existing LNbits installations that only configured a renepay rune.
-        #
+        # Prefer pay. Keep renepay for installations that only configured
+        # a renepay rune.
         if self.pay_headers:
             method = "pay"
             headers = self.pay_headers
@@ -508,9 +503,6 @@ class CLNRestWallet(Wallet):
                 )
 
             if status == "failed":
-                # Reconcile before turning a failed RPC result into a final
-                # LNbits failure. This handles races and duplicate/retried
-                # payment requests safely.
                 reconciled = await self._reconcile_payment_response(
                     response_hash,
                     fallback_error=(
@@ -531,7 +523,6 @@ class CLNRestWallet(Wallet):
                     ),
                 )
 
-            # Unexpected response state. Do not guess.
             return await self._reconcile_payment_response(
                 response_hash,
                 fallback_error=(
@@ -542,8 +533,6 @@ class CLNRestWallet(Wallet):
         except httpx.HTTPStatusError as exc:
             parsed_error = self._parse_rpc_http_error(exc)
 
-            # An HTTP/RPC error does not prove the payment failed.
-            # Reconcile first, particularly for CLN error 201 / already paid.
             reconciled = await self._reconcile_payment_response(
                 payment_hash,
                 fallback_error=parsed_error["message"],
@@ -570,8 +559,8 @@ class CLNRestWallet(Wallet):
                 f"Failed to pay invoice {payment_hash} using {method}: {exc}"
             )
 
-            # Transport failures are inherently ambiguous. The payment may
-            # have reached lightningd even though LNbits lost the response.
+            # A transport failure is ambiguous because lightningd may have
+            # accepted the payment before LNbits lost the response.
             return await self._reconcile_payment_response(
                 payment_hash,
                 fallback_error=str(exc),
@@ -653,27 +642,29 @@ class CLNRestWallet(Wallet):
 
     async def paid_invoices_stream(self) -> AsyncGenerator[str, None]:
         """
-        Wait for paid invoices using Core Lightning's documented
-        waitanyinvoice iteration:
+        Listen for newly paid invoices without replaying CLN's historical
+        invoice database when LNbits starts.
 
-            waitanyinvoice(lastpay_index)
-              -> one invoice
-              -> save returned pay_index
-              -> repeat
+        Startup behavior:
+          1. If CLNREST_LAST_PAY_INDEX is explicitly non-zero, use it.
+          2. Otherwise find the highest currently paid pay_index.
+          3. Start waitanyinvoice from that cursor.
+          4. Emit only newer paid invoices.
 
-        This is a long-polling RPC call, not a line-oriented streaming
-        response.
+        LNbits separately reconciles its pending database entries at startup,
+        so the event listener does not need to replay CLN's entire history.
         """
 
         while settings.lnbits_running:
             try:
-                data = {
-                    "lastpay_index": self.last_pay_index,
-                }
+                if not self._listener_bootstrapped:
+                    await self._bootstrap_listener_index()
 
                 invoice = await self._rpc(
                     "waitanyinvoice",
-                    payload=data,
+                    payload={
+                        "lastpay_index": self.last_pay_index,
+                    },
                     headers=self.readonly_headers,
                     timeout=None,
                 )
@@ -688,17 +679,36 @@ class CLNRestWallet(Wallet):
 
                 if pay_index is None:
                     logger.warning(
-                        "waitanyinvoice returned paid invoice without pay_index"
+                        "waitanyinvoice returned a paid invoice "
+                        "without pay_index"
                     )
                     continue
 
-                # Move the cursor before yielding so a consumer exception does
-                # not repeatedly emit the same paid invoice.
-                self.last_pay_index = int(pay_index)
+                try:
+                    pay_index = int(pay_index)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "waitanyinvoice returned invalid pay_index: "
+                        f"{pay_index!r}"
+                    )
+                    continue
+
+                # Defensive replay protection.
+                if pay_index <= self.last_pay_index:
+                    logger.warning(
+                        "Ignoring stale CLN invoice event "
+                        f"pay_index={pay_index}, "
+                        f"last_pay_index={self.last_pay_index}"
+                    )
+                    continue
+
+                # Advance before yielding so downstream cancellation/error
+                # cannot immediately replay this event in the same process.
+                self.last_pay_index = pay_index
 
                 if not payment_hash:
                     logger.warning(
-                        "waitanyinvoice returned paid invoice "
+                        "waitanyinvoice returned a paid invoice "
                         "without payment_hash"
                     )
                     continue
@@ -709,16 +719,18 @@ class CLNRestWallet(Wallet):
                 )
 
                 if preimage and not _preimage_matches(
-                    preimage, payment_hash
+                    preimage,
+                    payment_hash,
                 ):
                     logger.error(
-                        "waitanyinvoice returned invalid "
-                        f"preimage for {payment_hash}"
+                        "waitanyinvoice returned invalid preimage "
+                        f"for payment_hash={payment_hash}"
                     )
                     continue
 
                 logger.debug(
-                    f"paid invoice: payment_hash={payment_hash}, "
+                    "new paid CLN invoice: "
+                    f"payment_hash={payment_hash}, "
                     f"pay_index={self.last_pay_index}"
                 )
 
@@ -733,8 +745,92 @@ class CLNRestWallet(Wallet):
                     f"'{exc}', reconnecting..."
                 )
 
-                # Avoid a tight 20ms reconnect loop when CLN REST is offline.
                 await asyncio.sleep(1.0)
+
+    async def _bootstrap_listener_index(self) -> None:
+        """
+        Initialize waitanyinvoice at the current end of CLN's paid-invoice
+        history so restarting LNbits does not replay historical payments.
+
+        If CLNREST_LAST_PAY_INDEX is explicitly configured to a non-zero
+        value, preserve it and treat it as an operator-specified resume cursor.
+
+        If bootstrap fails, do not silently fall back to zero: doing so would
+        replay historical invoices. The listener retries bootstrap instead.
+        """
+
+        if self._listener_bootstrapped:
+            return
+
+        if self.last_pay_index > 0:
+            logger.info(
+                "Using configured CLN waitanyinvoice cursor "
+                f"pay_index={self.last_pay_index}"
+            )
+            self._listener_bootstrapped = True
+            return
+
+        logger.info(
+            "Bootstrapping CLN invoice listener to current pay_index"
+        )
+
+        try:
+            data = await self._rpc(
+                "listinvoices",
+                headers=self.readonly_headers,
+                timeout=30.0,
+            )
+
+            invoices = data.get("invoices") or []
+            highest_pay_index = 0
+
+            for invoice in invoices:
+                if invoice.get("status") != "paid":
+                    continue
+
+                pay_index = invoice.get("pay_index")
+
+                if pay_index is None:
+                    continue
+
+                try:
+                    normalized_pay_index = int(pay_index)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Ignoring invalid CLN invoice pay_index: "
+                        f"{pay_index!r}"
+                    )
+                    continue
+
+                if normalized_pay_index > highest_pay_index:
+                    highest_pay_index = normalized_pay_index
+
+            self.last_pay_index = highest_pay_index
+            self._listener_bootstrapped = True
+
+            if highest_pay_index > 0:
+                logger.info(
+                    "CLN invoice listener bootstrapped at "
+                    f"pay_index={highest_pay_index}; "
+                    "historical paid invoices will not be replayed"
+                )
+            else:
+                logger.info(
+                    "No historical paid CLN invoices found; "
+                    "starting waitanyinvoice from pay_index=0"
+                )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:
+            # Never mark bootstrap complete here. The calling listener will
+            # sleep and retry instead of accidentally starting from zero.
+            logger.warning(
+                "Unable to bootstrap CLN invoice listener safely: "
+                f"{exc}"
+            )
+            raise
 
     async def _get_listpays_status(
         self,
@@ -800,8 +896,8 @@ class CLNRestWallet(Wallet):
         """
         Reconcile an ambiguous payment result through listpays.
 
-        This is used after timeouts, HTTP errors, duplicate/already-paid
-        responses, and unusual pay responses.
+        Used after timeouts, HTTP errors, duplicate/already-paid responses,
+        and unusual pay responses.
 
         Only a confirmed complete payment is reported as success.
         """
@@ -838,8 +934,8 @@ class CLNRestWallet(Wallet):
                 f"Could not reconcile payment {payment_hash}: {exc}"
             )
 
-        # If we cannot prove success or terminal failure, preserve the
-        # payment as pending. This is critical to prevent double payment.
+        # If success or terminal failure cannot be proven, preserve pending
+        # status so LNbits does not accidentally retry and double-pay.
         return PaymentResponse(
             ok=None,
             checking_id=payment_hash,
@@ -868,8 +964,8 @@ class CLNRestWallet(Wallet):
             pass
 
         if response.is_error:
-            # Preserve the actual response object so callers can inspect CLN's
-            # JSON-RPC error body instead of seeing only "HTTP 500".
+            # Preserve the actual CLN response object so callers can inspect
+            # the RPC error body instead of seeing only a generic HTTP 500.
             message = (
                 self._extract_error_message(parsed_body)
                 if isinstance(parsed_body, dict)
@@ -877,9 +973,8 @@ class CLNRestWallet(Wallet):
             )
 
             raise httpx.HTTPStatusError(
-                message or (
-                    f"CLN REST returned HTTP {response.status_code}"
-                ),
+                message
+                or f"CLN REST returned HTTP {response.status_code}",
                 request=response.request,
                 response=response,
             )
@@ -1068,11 +1163,8 @@ class CLNRestWallet(Wallet):
                 cadata=ca_content,
             )
 
-        # CLN's local certificates are frequently used with localhost or an
-        # IP address that is not represented in the certificate SAN.
-        #
-        # This disables hostname matching only. Certificate validation against
-        # the configured CLNREST_CA remains active.
+        # Disable hostname matching only. Certificate validation against the
+        # configured CA remains active.
         ssl_context.check_hostname = False
 
         return httpx.AsyncClient(
@@ -1159,10 +1251,9 @@ def _select_best_pay(
     """
     Select the most useful logical payment status.
 
-    listpays normally combines payment parts into one entry when filtered by
-    payment_hash, but handling multiple entries defensively avoids converting
-    an existing successful payment into pending merely because more than one
-    result was returned.
+    Handling multiple entries defensively avoids converting an existing
+    successful payment into pending merely because more than one result
+    was returned.
     """
 
     complete = [
