@@ -1,3 +1,4 @@
+from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -302,7 +303,7 @@ class StrikeApiError:
     @classmethod
     def from_response(  # noqa: C901
         cls, response: httpx.Response
-    ) -> StrikeApiError:
+    ) -> "StrikeApiError":
         try:
             if len(response.content) > 1024 * 1024:
                 raise ValueError("oversized Strike error")
