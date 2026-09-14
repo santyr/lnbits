@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 import asyncio
 import hashlib
@@ -2108,7 +2107,13 @@ class TokenBucket:
 class StrikeWallet(Wallet):
     """LNbits funding source backed by the Strike v1 API."""
 
-    features = [Feature.descriptionhash]
+    # The capability marker is optional across LNbits builds. Invoice hashing
+    # below does not depend on registering this feature with the host.
+    features = [
+        feature
+        for feature in (getattr(Feature, "descriptionhash", None),)
+        if feature is not None
+    ]
 
     def __init__(
         self,
